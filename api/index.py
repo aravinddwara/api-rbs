@@ -57,49 +57,58 @@ async def get_bypass_cookie():
         if current_time - COOKIE_CACHE["timestamp"] < COOKIE_EXPIRY:
             return COOKIE_CACHE["cookie"]
     
-    # Try multiple times with different strategies
+    # Try multiple URLs and methods
+    urls_to_try = [
+        f"{BASE_URL}/tv/p.php",
+        f"{NEW_URL}/tv/p.php",
+        f"{BASE_URL}/p.php",
+        f"{NEW_URL}/p.php"
+    ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/home"
+    }
+    
     async with httpx.AsyncClient(
         timeout=30.0,
         follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers=headers
     ) as client:
-        for attempt in range(10):
+        for url in urls_to_try:
             try:
-                # Try POST first
-                response = await client.post(f"{BASE_URL}/tv/p.php")
-                
-                # Check for cookie in response
+                # Try POST
+                response = await client.post(url)
                 cookie = response.cookies.get("t_hash_t", "")
+                
                 if cookie:
                     COOKIE_CACHE["cookie"] = cookie
                     COOKIE_CACHE["timestamp"] = current_time
                     return cookie
                 
-                # Check JSON response
-                try:
-                    data = response.json()
-                    if data.get("r") == "n" and cookie:
-                        COOKIE_CACHE["cookie"] = cookie
-                        COOKIE_CACHE["timestamp"] = current_time
-                        return cookie
-                except:
-                    pass
+                # Try GET
+                response = await client.get(url)
+                cookie = response.cookies.get("t_hash_t", "")
                 
-                await asyncio.sleep(2)
-            except Exception as e:
-                if attempt == 9:
-                    # Last resort: use a fallback cookie (may work temporarily)
-                    fallback = "fallback_token_" + str(int(current_time))
-                    COOKIE_CACHE["cookie"] = fallback
+                if cookie:
+                    COOKIE_CACHE["cookie"] = cookie
                     COOKIE_CACHE["timestamp"] = current_time
-                    return fallback
-                await asyncio.sleep(3)
+                    return cookie
+                    
+                await asyncio.sleep(1)
+            except:
+                continue
     
     # Return cached if available, even if expired
     if "cookie" in COOKIE_CACHE:
         return COOKIE_CACHE["cookie"]
     
-    raise Exception("Failed to obtain bypass cookie")
+    # Return empty string instead of raising - let the API try without it
+    return ""
 
 
 def get_unix_time():
@@ -116,23 +125,36 @@ async def handle_search(provider, query):
     try:
         cookie = await get_bypass_cookie()
     except Exception as e:
-        return {"error": f"Cookie error: {str(e)}"}, 500
+        cookie = ""  # Continue without cookie
     
-    cookies = {"t_hash_t": cookie, "hd": "on", "ott": config["ott"]}
+    cookies = {"hd": "on", "ott": config["ott"]}
+    if cookie:
+        cookies["t_hash_t"] = cookie
     if provider == "netflix":
         cookies["user_token"] = config["user_token"]
     
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     url = f"{BASE_URL}{config['search_endpoint']}?s={query}&t={get_unix_time()}"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=headers, cookies=cookies)
-            data = response.json()
+            
+            # Check if response is empty
+            if not response.text or response.text.strip() == "":
+                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
+            
+            # Try to parse JSON
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
             
             results = []
             for item in data.get("searchResult", []):
@@ -148,6 +170,8 @@ async def handle_search(provider, query):
                 })
             
             return {"provider": provider, "query": query, "results": results, "count": len(results)}, 200
+    except httpx.TimeoutException:
+        return {"error": "Request timeout", "provider": provider}, 500
     except Exception as e:
         return {"error": f"Search failed: {str(e)}", "provider": provider}, 500
 
@@ -194,23 +218,36 @@ async def handle_details(provider, content_id):
     try:
         cookie = await get_bypass_cookie()
     except Exception as e:
-        return {"error": f"Cookie error: {str(e)}"}, 500
+        cookie = ""  # Continue without cookie
     
-    cookies = {"t_hash_t": cookie, "hd": "on", "ott": config["ott"]}
+    cookies = {"hd": "on", "ott": config["ott"]}
+    if cookie:
+        cookies["t_hash_t"] = cookie
     if provider == "netflix":
         cookies["user_token"] = config["user_token"]
     
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     url = f"{BASE_URL}{config['post_endpoint']}?id={content_id}&t={get_unix_time()}"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=headers, cookies=cookies)
-            data = response.json()
+            
+            # Check if response is empty
+            if not response.text or response.text.strip() == "":
+                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
+            
+            # Try to parse JSON
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
             
             episodes = []
             if data.get("episodes") and data["episodes"][0]:
@@ -233,7 +270,7 @@ async def handle_details(provider, content_id):
             
             result = {
                 "id": content_id,
-                "title": data["title"],
+                "title": data.get("title", "Unknown"),
                 "description": data.get("desc"),
                 "year": data.get("year"),
                 "type": "movie" if not episodes else "series",
@@ -247,6 +284,8 @@ async def handle_details(provider, content_id):
             }
             
             return result, 200
+    except httpx.TimeoutException:
+        return {"error": "Request timeout", "provider": provider}, 500
     except Exception as e:
         return {"error": f"Failed to get details: {str(e)}", "provider": provider}, 500
 
@@ -261,23 +300,36 @@ async def handle_stream(provider, content_id, title):
     try:
         cookie = await get_bypass_cookie()
     except Exception as e:
-        return {"error": f"Cookie error: {str(e)}"}, 500
+        cookie = ""  # Continue without cookie
     
-    cookies = {"t_hash_t": cookie, "hd": "on", "ott": config["ott"]}
+    cookies = {"hd": "on", "ott": config["ott"]}
+    if cookie:
+        cookies["t_hash_t"] = cookie
     if provider == "netflix":
         cookies["user_token"] = config["user_token"]
     
     headers = {
         "X-Requested-With": "XMLHttpRequest",
         "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9"
     }
     url = f"{NEW_URL}{config['playlist_endpoint']}?id={content_id}&t={title}&tm={get_unix_time()}"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(url, headers=headers, cookies=cookies)
-            playlist = response.json()
+            
+            # Check if response is empty
+            if not response.text or response.text.strip() == "":
+                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
+            
+            # Try to parse JSON
+            try:
+                playlist = response.json()
+            except json.JSONDecodeError as e:
+                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
             
             streams = []
             subtitles = []
@@ -319,6 +371,8 @@ async def handle_stream(provider, content_id, title):
             }
             
             return result, 200
+    except httpx.TimeoutException:
+        return {"error": "Request timeout", "provider": provider}, 500
     except Exception as e:
         return {"error": f"Failed to get streams: {str(e)}", "provider": provider}, 500
 
@@ -344,7 +398,8 @@ class handler(BaseHTTPRequestHandler):
             if path == '/' or path == '':
                 response = {
                     "name": "NetMirror Stream API",
-                    "version": "1.0.0",
+                    "version": "1.0.1",
+                    "status": "running",
                     "providers": list(PROVIDERS.keys()),
                     "endpoints": {
                         "unified_search": "/api/search?query={query} - Search all providers",
@@ -357,7 +412,11 @@ class handler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps(response).encode())
                 
             elif path == '/health':
-                response = {"status": "healthy", "timestamp": datetime.now().isoformat()}
+                response = {
+                    "status": "healthy",
+                    "timestamp": datetime.now().isoformat(),
+                    "cookie_cached": "cookie" in COOKIE_CACHE
+                }
                 self.wfile.write(json.dumps(response).encode())
                 
             elif path.startswith('/api/'):
@@ -418,7 +477,7 @@ class handler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(json.dumps({"error": str(e), "type": type(e).__name__}).encode())
     
     def do_OPTIONS(self):
         """Handle OPTIONS for CORS"""
