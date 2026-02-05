@@ -5,199 +5,378 @@ import httpx
 import asyncio
 import time
 from datetime import datetime
+import hashlib
 
 # Configuration
-BASE_URL = "https://net20.cc"
-NEW_URL = "https://net51.cc"
-COOKIE_CACHE = {}
-COOKIE_EXPIRY = 15 * 60 * 60
+BASE_DOMAIN = "net20.cc"
+STREAM_DOMAIN = "net51.cc"
+BASE_URL = f"https://{BASE_DOMAIN}"
+STREAM_URL = f"https://{STREAM_DOMAIN}"
 
+# Global cookie cache
+COOKIE_CACHE = {
+    "cookie": None,
+    "timestamp": 0,
+    "expiry": 15 * 60 * 60  # 15 hours
+}
+
+# Provider configurations
 PROVIDERS = {
     "netflix": {
-        "ott": "nf",
+        "id": "nf",
+        "name": "Netflix",
+        "search_path": "/search.php",
+        "details_path": "/post.php",
+        "stream_path": "/tv/playlist.php",
+        "episodes_path": "/episodes.php",
         "poster_base": "https://imgcdn.kim/poster/v",
         "episode_poster": "https://imgcdn.kim/epimg/150",
-        "search_endpoint": "/search.php",
-        "post_endpoint": "/post.php",
-        "playlist_endpoint": "/tv/playlist.php",
-        "user_token": "233123f803cf02184bf6c67e149cdd50"
+        "user_token": "233123f803cf02184bf6c67e149cdd50",
+        "requires_token": True
     },
     "primevideo": {
-        "ott": "pv",
-        "poster_base": "https://wsrv.nl/?url=https://imgcdn.kim/pv/v",
+        "id": "pv",
+        "name": "Prime Video",
+        "search_path": "/pv/search.php",
+        "details_path": "/pv/post.php",
+        "stream_path": "/pv/playlist.php",
+        "episodes_path": "/pv/episodes.php",
+        "poster_base": "https://imgcdn.kim/pv/v",
         "episode_poster": "https://imgcdn.kim/pvepimg/150",
-        "search_endpoint": "/pv/search.php",
-        "post_endpoint": "/pv/post.php",
-        "playlist_endpoint": "/pv/playlist.php"
+        "requires_token": False
     },
     "hotstar": {
-        "ott": "hs",
+        "id": "hs",
+        "name": "Hotstar",
+        "search_path": "/mobile/hs/search.php",
+        "details_path": "/mobile/hs/post.php",
+        "stream_path": "/mobile/hs/playlist.php",
+        "episodes_path": "/mobile/hs/episodes.php",
         "poster_base": "https://imgcdn.kim/hs/v",
         "episode_poster": "https://imgcdn.kim/hsepimg/150",
-        "search_endpoint": "/mobile/hs/search.php",
-        "post_endpoint": "/mobile/hs/post.php",
-        "playlist_endpoint": "/mobile/hs/playlist.php"
+        "requires_token": False
     },
     "disneyplus": {
-        "ott": "dp",
+        "id": "dp",
+        "name": "Disney+",
+        "search_path": "/mobile/hs/search.php",
+        "details_path": "/mobile/hs/post.php",
+        "stream_path": "/mobile/hs/playlist.php",
+        "episodes_path": "/mobile/hs/episodes.php",
         "poster_base": "https://imgcdn.kim/hs/v",
         "episode_poster": "https://imgcdn.kim/hsepimg/150",
-        "search_endpoint": "/mobile/hs/search.php",
-        "post_endpoint": "/mobile/hs/post.php",
-        "playlist_endpoint": "/mobile/hs/playlist.php"
+        "requires_token": False
     }
 }
 
 
-async def get_bypass_cookie():
-    """Get bypass cookie with caching"""
-    current_time = time.time()
-    
-    if "cookie" in COOKIE_CACHE and "timestamp" in COOKIE_CACHE:
-        if current_time - COOKIE_CACHE["timestamp"] < COOKIE_EXPIRY:
-            return COOKIE_CACHE["cookie"]
-    
-    # Try multiple URLs and methods
-    urls_to_try = [
-        f"{BASE_URL}/tv/p.php",
-        f"{NEW_URL}/tv/p.php",
-        f"{BASE_URL}/p.php",
-        f"{NEW_URL}/p.php"
-    ]
-    
-    headers = {
+def get_timestamp():
+    """Get current Unix timestamp in milliseconds"""
+    return int(time.time() * 1000)
+
+
+def get_headers(provider_id=None):
+    """Get standard headers for requests"""
+    return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
         "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"{BASE_URL}/home",
         "Origin": BASE_URL,
-        "Referer": f"{BASE_URL}/home"
+    }
+
+
+def get_cookies(provider_id, bypass_cookie=None):
+    """Get cookies for a specific provider"""
+    cookies = {
+        "hd": "on",
+        "ott": provider_id
     }
     
-    async with httpx.AsyncClient(
-        timeout=30.0,
-        follow_redirects=True,
-        headers=headers
-    ) as client:
-        for url in urls_to_try:
-            try:
-                # Try POST
-                response = await client.post(url)
-                cookie = response.cookies.get("t_hash_t", "")
-                
-                if cookie:
-                    COOKIE_CACHE["cookie"] = cookie
-                    COOKIE_CACHE["timestamp"] = current_time
-                    return cookie
-                
-                # Try GET
-                response = await client.get(url)
-                cookie = response.cookies.get("t_hash_t", "")
-                
-                if cookie:
-                    COOKIE_CACHE["cookie"] = cookie
-                    COOKIE_CACHE["timestamp"] = current_time
-                    return cookie
-                    
-                await asyncio.sleep(1)
-            except:
-                continue
+    if bypass_cookie:
+        cookies["t_hash_t"] = bypass_cookie
     
-    # Return cached if available, even if expired
-    if "cookie" in COOKIE_CACHE:
+    # Add user token for Netflix
+    if provider_id == "nf":
+        cookies["user_token"] = PROVIDERS["netflix"]["user_token"]
+    
+    return cookies
+
+
+async def get_bypass_cookie(force_refresh=False):
+    """
+    Obtain bypass cookie from the service
+    Uses multiple strategies and caching
+    """
+    current_time = time.time()
+    
+    # Return cached cookie if valid
+    if not force_refresh and COOKIE_CACHE["cookie"]:
+        if current_time - COOKIE_CACHE["timestamp"] < COOKIE_CACHE["expiry"]:
+            return COOKIE_CACHE["cookie"]
+    
+    # URLs to try for cookie
+    endpoints = [
+        f"{BASE_URL}/tv/p.php",
+        f"{STREAM_URL}/tv/p.php",
+        f"{BASE_URL}/p.php",
+        f"{STREAM_URL}/p.php"
+    ]
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"{BASE_URL}/home",
+        "Origin": BASE_URL
+    }
+    
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+        for endpoint in endpoints:
+            for method in ["POST", "GET"]:
+                try:
+                    if method == "POST":
+                        response = await client.post(endpoint, headers=headers)
+                    else:
+                        response = await client.get(endpoint, headers=headers)
+                    
+                    # Check for cookie
+                    cookie = response.cookies.get("t_hash_t")
+                    if cookie:
+                        COOKIE_CACHE["cookie"] = cookie
+                        COOKIE_CACHE["timestamp"] = current_time
+                        return cookie
+                    
+                    # Check response for verification
+                    try:
+                        data = response.json()
+                        if data.get("r") == "n":
+                            cookie = response.cookies.get("t_hash_t")
+                            if cookie:
+                                COOKIE_CACHE["cookie"] = cookie
+                                COOKIE_CACHE["timestamp"] = current_time
+                                return cookie
+                    except:
+                        pass
+                    
+                    await asyncio.sleep(0.5)
+                    
+                except Exception as e:
+                    continue
+    
+    # Return cached even if expired as fallback
+    if COOKIE_CACHE["cookie"]:
         return COOKIE_CACHE["cookie"]
     
-    # Return empty string instead of raising - let the API try without it
-    return ""
+    # Generate a fallback cookie
+    fallback = f"fallback_{hashlib.md5(str(current_time).encode()).hexdigest()[:16]}"
+    COOKIE_CACHE["cookie"] = fallback
+    COOKIE_CACHE["timestamp"] = current_time
+    return fallback
 
 
-def get_unix_time():
-    return int(time.time() * 1000)
+async def make_request(url, provider_id, bypass_cookie):
+    """Make a request to the streaming service"""
+    headers = get_headers(provider_id)
+    cookies = get_cookies(provider_id, bypass_cookie)
+    
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(url, headers=headers, cookies=cookies)
+        
+        if not response.text or not response.text.strip():
+            raise ValueError("Empty response from server")
+        
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            raise ValueError(f"Invalid JSON response: {response.text[:200]}")
 
 
-async def handle_search(provider, query):
-    """Handle search request"""
+async def search_content(provider, query):
+    """Search for content on a specific provider"""
     if provider not in PROVIDERS:
         return {"error": f"Invalid provider: {provider}"}, 400
     
     config = PROVIDERS[provider]
+    bypass_cookie = await get_bypass_cookie()
+    
+    url = f"{BASE_URL}{config['search_path']}?s={query}&t={get_timestamp()}"
     
     try:
-        cookie = await get_bypass_cookie()
+        data = await make_request(url, config["id"], bypass_cookie)
+        
+        results = []
+        for item in data.get("searchResult", []):
+            results.append({
+                "id": item["id"],
+                "title": item["t"],
+                "provider": provider,
+                "poster_url": f"{config['poster_base']}/{item['id']}.jpg"
+            })
+        
+        return {
+            "provider": provider,
+            "query": query,
+            "results": results,
+            "count": len(results)
+        }, 200
+        
     except Exception as e:
-        cookie = ""  # Continue without cookie
+        return {"error": str(e), "provider": provider}, 500
+
+
+async def get_details(provider, content_id):
+    """Get detailed information about content"""
+    if provider not in PROVIDERS:
+        return {"error": f"Invalid provider: {provider}"}, 400
     
-    cookies = {"hd": "on", "ott": config["ott"]}
-    if cookie:
-        cookies["t_hash_t"] = cookie
-    if provider == "netflix":
-        cookies["user_token"] = config["user_token"]
+    config = PROVIDERS[provider]
+    bypass_cookie = await get_bypass_cookie()
     
-    headers = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    url = f"{BASE_URL}{config['search_endpoint']}?s={query}&t={get_unix_time()}"
+    url = f"{BASE_URL}{config['details_path']}?id={content_id}&t={get_timestamp()}"
     
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, cookies=cookies)
-            
-            # Check if response is empty
-            if not response.text or response.text.strip() == "":
-                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
-            
-            # Try to parse JSON
-            try:
-                data = response.json()
-            except json.JSONDecodeError as e:
-                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
-            
-            results = []
-            for item in data.get("searchResult", []):
-                poster = f"{config['poster_base']}/{item['id']}.jpg"
-                if provider == "primevideo":
-                    poster += "&w=500"
+        data = await make_request(url, config["id"], bypass_cookie)
+        
+        # Parse episodes
+        episodes = []
+        if data.get("episodes") and data["episodes"][0]:
+            for ep in data["episodes"]:
+                if ep:
+                    episodes.append({
+                        "id": ep["id"],
+                        "title": ep.get("t", ""),
+                        "episode": int(ep.get("ep", "E0").replace("E", "")) if ep.get("ep") else None,
+                        "season": int(ep.get("s", "S0").replace("S", "")) if ep.get("s") else None,
+                        "poster_url": f"{config['episode_poster']}/{ep['id']}.jpg"
+                    })
+        
+        # Parse cast and genres
+        cast = [n.strip() for n in data.get("cast", "").split(",")] if data.get("cast") else []
+        genres = [g.strip() for g in data.get("genre", "").split(",") if g.strip()]
+        
+        return {
+            "id": content_id,
+            "title": data.get("title", "Unknown"),
+            "description": data.get("desc"),
+            "year": data.get("year"),
+            "type": "movie" if not episodes else "series",
+            "poster_url": f"{config['poster_base']}/{content_id}.jpg",
+            "genres": genres,
+            "cast": cast,
+            "rating": data.get("match", "").replace("IMDb ", ""),
+            "provider": provider,
+            "episodes": episodes,
+            "total_episodes": len(episodes)
+        }, 200
+        
+    except Exception as e:
+        return {"error": str(e), "provider": provider}, 500
+
+
+async def get_stream(provider, content_id, title=""):
+    """Extract streaming URLs for content"""
+    if provider not in PROVIDERS:
+        return {"error": f"Invalid provider: {provider}"}, 400
+    
+    config = PROVIDERS[provider]
+    bypass_cookie = await get_bypass_cookie()
+    
+    # Build URL
+    url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
+    
+    try:
+        data = await make_request(url, config["id"], bypass_cookie)
+        
+        streams = []
+        subtitles = []
+        
+        # Handle array response
+        if isinstance(data, list):
+            playlist = data
+        else:
+            playlist = [data]
+        
+        for item in playlist:
+            # Extract streams
+            for source in item.get("sources", []):
+                file_url = source.get("file", "")
                 
-                results.append({
-                    "id": item["id"],
-                    "title": item["t"],
-                    "provider": provider,
-                    "poster_url": poster
+                # Clean up URL
+                if provider in ["netflix", "primevideo"]:
+                    file_url = file_url.replace("/tv/", "/")
+                
+                # Build full URL
+                if not file_url.startswith("http"):
+                    stream_url = f"{STREAM_URL}/{file_url.lstrip('/')}"
+                else:
+                    stream_url = file_url
+                
+                # Extract quality
+                quality = "HD"
+                if "q=" in file_url:
+                    quality = file_url.split("q=")[1].split("&")[0]
+                
+                streams.append({
+                    "url": stream_url,
+                    "quality": source.get("label", quality),
+                    "type": source.get("type", "m3u8"),
+                    "headers": {
+                        "Referer": f"{STREAM_URL}/home",
+                        "Cookie": "hd=on",
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    }
                 })
             
-            return {"provider": provider, "query": query, "results": results, "count": len(results)}, 200
-    except httpx.TimeoutException:
-        return {"error": "Request timeout", "provider": provider}, 500
+            # Extract subtitles
+            for track in item.get("tracks", []):
+                if track.get("kind") == "captions":
+                    sub_url = track.get("file", "")
+                    if sub_url:
+                        if sub_url.startswith("//"):
+                            sub_url = f"https:{sub_url}"
+                        elif not sub_url.startswith("http"):
+                            sub_url = f"{STREAM_URL}/{sub_url.lstrip('/')}"
+                        
+                        subtitles.append({
+                            "language": track.get("label", "Unknown"),
+                            "url": sub_url
+                        })
+        
+        return {
+            "id": content_id,
+            "title": title,
+            "provider": provider,
+            "streams": streams,
+            "subtitles": subtitles,
+            "timestamp": datetime.now().isoformat(),
+            "total_streams": len(streams)
+        }, 200
+        
     except Exception as e:
-        return {"error": f"Search failed: {str(e)}", "provider": provider}, 500
+        return {"error": str(e), "provider": provider}, 500
 
 
-async def handle_search_all(query):
-    """Search across all providers"""
+async def search_all_providers(query):
+    """Search across all providers concurrently"""
+    tasks = [search_content(provider, query) for provider in PROVIDERS.keys()]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
     all_results = []
     errors = []
     
-    # Search all providers concurrently
-    tasks = []
-    for provider in PROVIDERS.keys():
-        tasks.append(handle_search(provider, query))
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
     for i, result in enumerate(results):
         provider = list(PROVIDERS.keys())[i]
+        
         if isinstance(result, Exception):
             errors.append({"provider": provider, "error": str(result)})
-        else:
+        elif isinstance(result, tuple):
             data, status = result
-            if status == 200 and data.get("results"):
-                all_results.extend(data["results"])
-            elif status != 200:
-                errors.append({"provider": provider, "error": data.get("error", "Unknown error")})
+            if status == 200:
+                all_results.extend(data.get("results", []))
+            else:
+                errors.append({"provider": provider, "error": data.get("error", "Unknown")})
     
     return {
         "query": query,
@@ -208,281 +387,128 @@ async def handle_search_all(query):
     }, 200
 
 
-async def handle_details(provider, content_id):
-    """Handle details request"""
-    if provider not in PROVIDERS:
-        return {"error": f"Invalid provider: {provider}"}, 400
-    
-    config = PROVIDERS[provider]
-    
-    try:
-        cookie = await get_bypass_cookie()
-    except Exception as e:
-        cookie = ""  # Continue without cookie
-    
-    cookies = {"hd": "on", "ott": config["ott"]}
-    if cookie:
-        cookies["t_hash_t"] = cookie
-    if provider == "netflix":
-        cookies["user_token"] = config["user_token"]
-    
-    headers = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    url = f"{BASE_URL}{config['post_endpoint']}?id={content_id}&t={get_unix_time()}"
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, cookies=cookies)
-            
-            # Check if response is empty
-            if not response.text or response.text.strip() == "":
-                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
-            
-            # Try to parse JSON
-            try:
-                data = response.json()
-            except json.JSONDecodeError as e:
-                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
-            
-            episodes = []
-            if data.get("episodes") and data["episodes"][0]:
-                for ep in data["episodes"]:
-                    if ep:
-                        episodes.append({
-                            "id": ep["id"],
-                            "title": ep["t"],
-                            "episode": int(ep["ep"].replace("E", "")) if ep.get("ep") else None,
-                            "season": int(ep["s"].replace("S", "")) if ep.get("s") else None,
-                            "poster_url": f"{config['episode_poster']}/{ep['id']}.jpg"
-                        })
-            
-            cast = [n.strip() for n in data.get("cast", "").split(",")] if data.get("cast") else []
-            genres = [g.strip() for g in data.get("genre", "").split(",") if g.strip()]
-            
-            poster = f"{config['poster_base']}/{content_id}.jpg"
-            if provider == "primevideo":
-                poster += "&w=500"
-            
-            result = {
-                "id": content_id,
-                "title": data.get("title", "Unknown"),
-                "description": data.get("desc"),
-                "year": data.get("year"),
-                "type": "movie" if not episodes else "series",
-                "poster_url": poster,
-                "genres": genres,
-                "cast": cast,
-                "rating": data.get("match", "").replace("IMDb ", ""),
-                "provider": provider,
-                "episodes": episodes,
-                "total_episodes": len(episodes)
-            }
-            
-            return result, 200
-    except httpx.TimeoutException:
-        return {"error": "Request timeout", "provider": provider}, 500
-    except Exception as e:
-        return {"error": f"Failed to get details: {str(e)}", "provider": provider}, 500
-
-
-async def handle_stream(provider, content_id, title):
-    """Handle stream request"""
-    if provider not in PROVIDERS:
-        return {"error": f"Invalid provider: {provider}"}, 400
-    
-    config = PROVIDERS[provider]
-    
-    try:
-        cookie = await get_bypass_cookie()
-    except Exception as e:
-        cookie = ""  # Continue without cookie
-    
-    cookies = {"hd": "on", "ott": config["ott"]}
-    if cookie:
-        cookies["t_hash_t"] = cookie
-    if provider == "netflix":
-        cookies["user_token"] = config["user_token"]
-    
-    headers = {
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": f"{BASE_URL}/home",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9"
-    }
-    url = f"{NEW_URL}{config['playlist_endpoint']}?id={content_id}&t={title}&tm={get_unix_time()}"
-    
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, headers=headers, cookies=cookies)
-            
-            # Check if response is empty
-            if not response.text or response.text.strip() == "":
-                return {"error": "Empty response from server", "provider": provider, "debug": {"status": response.status_code, "url": url}}, 500
-            
-            # Try to parse JSON
-            try:
-                playlist = response.json()
-            except json.JSONDecodeError as e:
-                return {"error": f"Invalid JSON response: {response.text[:200]}", "provider": provider}, 500
-            
-            streams = []
-            subtitles = []
-            
-            for item in playlist:
-                for source in item.get("sources", []):
-                    file_url = source["file"]
-                    if provider in ["netflix", "primevideo"]:
-                        file_url = file_url.replace("/tv/", "/")
-                    
-                    stream_url = f"{NEW_URL}/{file_url}" if not file_url.startswith("http") else file_url
-                    quality = file_url.split("q=")[1].split("&")[0] if "q=" in file_url else "HD"
-                    
-                    streams.append({
-                        "url": stream_url,
-                        "quality": source.get("label", quality),
-                        "type": source.get("type", "m3u8"),
-                        "headers": {"Referer": f"{NEW_URL}/home", "Cookie": "hd=on"}
-                    })
-                
-                for track in item.get("tracks", []):
-                    if track.get("kind") == "captions":
-                        sub_url = track.get("file", "")
-                        if sub_url and not sub_url.startswith("http"):
-                            sub_url = f"https:{sub_url}" if sub_url.startswith("//") else sub_url
-                        
-                        subtitles.append({
-                            "language": track.get("label", "Unknown"),
-                            "url": sub_url
-                        })
-            
-            result = {
-                "id": content_id,
-                "title": title,
-                "provider": provider,
-                "streams": streams,
-                "subtitles": subtitles,
-                "timestamp": datetime.now().isoformat()
-            }
-            
-            return result, 200
-    except httpx.TimeoutException:
-        return {"error": "Request timeout", "provider": provider}, 500
-    except Exception as e:
-        return {"error": f"Failed to get streams: {str(e)}", "provider": provider}, 500
-
-
 class handler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        """Suppress default logging"""
+        pass
+    
+    def send_json_response(self, data, status=200):
+        """Send JSON response with proper headers"""
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
+    
+    def do_OPTIONS(self):
+        """Handle CORS preflight"""
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', '*')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.end_headers()
+    
     def do_GET(self):
         """Handle GET requests"""
         try:
-            # Parse URL
             parsed = urlparse(self.path)
             path = parsed.path
             params = parse_qs(parsed.query)
             
-            # CORS headers
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', '*')
-            self.end_headers()
-            
-            # Route handling
-            if path == '/' or path == '':
+            # Root endpoint
+            if path in ['/', '']:
                 response = {
-                    "name": "NetMirror Stream API",
-                    "version": "1.0.1",
-                    "status": "running",
-                    "providers": list(PROVIDERS.keys()),
+                    "name": "Streaming Content API",
+                    "version": "2.0.0",
+                    "status": "online",
+                    "providers": {k: v["name"] for k, v in PROVIDERS.items()},
                     "endpoints": {
-                        "unified_search": "/api/search?query={query} - Search all providers",
+                        "search_all": "/api/search?query={query}",
                         "search": "/api/{provider}/search?query={query}",
                         "details": "/api/{provider}/details?id={id}",
                         "stream": "/api/{provider}/stream?id={id}&title={title}",
                         "health": "/health"
                     }
                 }
-                self.wfile.write(json.dumps(response).encode())
-                
-            elif path == '/health':
+                self.send_json_response(response)
+                return
+            
+            # Health check
+            if path == '/health':
                 response = {
                     "status": "healthy",
                     "timestamp": datetime.now().isoformat(),
-                    "cookie_cached": "cookie" in COOKIE_CACHE
+                    "cookie_cached": COOKIE_CACHE["cookie"] is not None,
+                    "cookie_age": int(time.time() - COOKIE_CACHE["timestamp"]) if COOKIE_CACHE["cookie"] else None
                 }
-                self.wfile.write(json.dumps(response).encode())
+                self.send_json_response(response)
+                return
+            
+            # API endpoints
+            if path.startswith('/api/'):
+                parts = [p for p in path.split('/') if p]
                 
-            elif path.startswith('/api/'):
-                parts = path.split('/')
-                
-                # Handle unified search: /api/search
-                if len(parts) == 3 and parts[2] == 'search':
+                # Unified search
+                if len(parts) == 2 and parts[1] == 'search':
                     query = params.get('query', [''])[0]
                     if not query:
-                        self.wfile.write(json.dumps({"error": "Query parameter required"}).encode())
+                        self.send_json_response({"error": "Query parameter required"}, 400)
                         return
                     
-                    result, status = asyncio.run(handle_search_all(query))
-                    self.wfile.write(json.dumps(result).encode())
+                    result, status = asyncio.run(search_all_providers(query))
+                    self.send_json_response(result, status)
+                    return
                 
-                # Handle provider-specific endpoints
-                elif len(parts) >= 4:
-                    provider = parts[2]
-                    action = parts[3]
+                # Provider-specific endpoints
+                if len(parts) >= 3:
+                    provider = parts[1]
+                    action = parts[2]
                     
                     if action == 'search':
                         query = params.get('query', [''])[0]
                         if not query:
-                            self.wfile.write(json.dumps({"error": "Query parameter required"}).encode())
+                            self.send_json_response({"error": "Query parameter required"}, 400)
                             return
                         
-                        result, status = asyncio.run(handle_search(provider, query))
-                        self.wfile.write(json.dumps(result).encode())
-                        
+                        result, status = asyncio.run(search_content(provider, query))
+                        self.send_json_response(result, status)
+                        return
+                    
                     elif action == 'details':
                         content_id = params.get('id', [''])[0]
                         if not content_id:
-                            self.wfile.write(json.dumps({"error": "ID parameter required"}).encode())
+                            self.send_json_response({"error": "ID parameter required"}, 400)
                             return
                         
-                        result, status = asyncio.run(handle_details(provider, content_id))
-                        self.wfile.write(json.dumps(result).encode())
-                        
+                        result, status = asyncio.run(get_details(provider, content_id))
+                        self.send_json_response(result, status)
+                        return
+                    
                     elif action == 'stream':
                         content_id = params.get('id', [''])[0]
                         title = params.get('title', [''])[0]
+                        
                         if not content_id:
-                            self.wfile.write(json.dumps({"error": "ID parameter required"}).encode())
+                            self.send_json_response({"error": "ID parameter required"}, 400)
                             return
                         
-                        result, status = asyncio.run(handle_stream(provider, content_id, title))
-                        self.wfile.write(json.dumps(result).encode())
-                        
-                    else:
-                        self.wfile.write(json.dumps({"error": "Invalid action"}).encode())
-                else:
-                    self.wfile.write(json.dumps({"error": "Invalid path"}).encode())
-            else:
-                self.wfile.write(json.dumps({"error": "Not found"}).encode())
-                
+                        result, status = asyncio.run(get_stream(provider, content_id, title))
+                        self.send_json_response(result, status)
+                        return
+            
+            # 404
+            self.send_json_response({"error": "Endpoint not found"}, 404)
+            
         except Exception as e:
-            self.send_response(500)
-            self.send_header('Content-type', 'application/json')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e), "type": type(e).__name__}).encode())
+            self.send_json_response({
+                "error": str(e),
+                "type": type(e).__name__
+            }, 500)
     
-    def do_OPTIONS(self):
-        """Handle OPTIONS for CORS"""
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', '*')
-        self.end_headers()
+    def do_POST(self):
+        """Handle POST requests"""
+        self.do_GET()
