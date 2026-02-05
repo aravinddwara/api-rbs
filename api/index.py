@@ -76,7 +76,7 @@ def get_timestamp():
 
 
 def get_headers(provider_id=None):
-    """Get standard headers for requests"""
+    """Get standard headers for requests - matching CloudStream"""
     return {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -88,7 +88,7 @@ def get_headers(provider_id=None):
 
 
 def get_cookies(provider_id, bypass_cookie=None):
-    """Get cookies for a specific provider"""
+    """Get cookies for a specific provider - matching CloudStream"""
     cookies = {
         "hd": "on",
         "ott": provider_id
@@ -106,90 +106,89 @@ def get_cookies(provider_id, bypass_cookie=None):
 
 async def get_bypass_cookie(force_refresh=False):
     """
-    Obtain bypass cookie from the service
-    Uses multiple strategies and caching
+    Obtain bypass cookie - exactly matching CloudStream's bypass() function
     """
     current_time = time.time()
     
-    # Return cached cookie if valid
+    # Return cached cookie if valid (≤15 hours old)
     if not force_refresh and COOKIE_CACHE["cookie"]:
         if current_time - COOKIE_CACHE["timestamp"] < COOKIE_CACHE["expiry"]:
             return COOKIE_CACHE["cookie"]
     
-    # URLs to try for cookie
-    endpoints = [
-        f"{BASE_URL}/tv/p.php",
-        f"{STREAM_URL}/tv/p.php",
-        f"{BASE_URL}/p.php",
-        f"{STREAM_URL}/p.php"
-    ]
+    # CloudStream's bypass logic: POST to /tv/p.php until we get {"r":"n"}
+    max_attempts = 10
+    attempt = 0
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "*/*",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"{BASE_URL}/home",
-        "Origin": BASE_URL
+        "Origin": BASE_URL,
+        "X-Requested-With": "XMLHttpRequest"
     }
     
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-        for endpoint in endpoints:
-            for method in ["POST", "GET"]:
+        while attempt < max_attempts:
+            try:
+                # POST request to bypass endpoint
+                response = await client.post(
+                    f"{BASE_URL}/tv/p.php",
+                    headers=headers,
+                    cookies={"hd": "on"}
+                )
+                
+                # Check if we got the right response
                 try:
-                    if method == "POST":
-                        response = await client.post(endpoint, headers=headers)
-                    else:
-                        response = await client.get(endpoint, headers=headers)
-                    
-                    # Check for cookie
-                    cookie = response.cookies.get("t_hash_t")
-                    if cookie:
-                        COOKIE_CACHE["cookie"] = cookie
-                        COOKIE_CACHE["timestamp"] = current_time
-                        return cookie
-                    
-                    # Check response for verification
-                    try:
-                        data = response.json()
-                        if data.get("r") == "n":
-                            cookie = response.cookies.get("t_hash_t")
-                            if cookie:
-                                COOKIE_CACHE["cookie"] = cookie
-                                COOKIE_CACHE["timestamp"] = current_time
-                                return cookie
-                    except:
-                        pass
-                    
-                    await asyncio.sleep(0.5)
-                    
-                except Exception as e:
-                    continue
+                    data = response.json()
+                    if data.get("r") == "n":
+                        # Success! Extract the cookie
+                        cookie = response.cookies.get("t_hash_t")
+                        if cookie:
+                            COOKIE_CACHE["cookie"] = cookie
+                            COOKIE_CACHE["timestamp"] = current_time
+                            return cookie
+                except:
+                    pass
+                
+                # Also check cookies even if JSON parsing fails
+                cookie = response.cookies.get("t_hash_t")
+                if cookie:
+                    COOKIE_CACHE["cookie"] = cookie
+                    COOKIE_CACHE["timestamp"] = current_time
+                    return cookie
+                
+                attempt += 1
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                attempt += 1
+                await asyncio.sleep(0.5)
+                continue
     
-    # Return cached even if expired as fallback
+    # If we couldn't get a cookie, return cached one if available
     if COOKIE_CACHE["cookie"]:
         return COOKIE_CACHE["cookie"]
     
-    # Generate a fallback cookie
-    fallback = f"fallback_{hashlib.md5(str(current_time).encode()).hexdigest()[:16]}"
-    COOKIE_CACHE["cookie"] = fallback
-    COOKIE_CACHE["timestamp"] = current_time
-    return fallback
+    raise ValueError("Failed to obtain bypass cookie after multiple attempts")
 
 
 async def make_request(url, provider_id, bypass_cookie):
-    """Make a request to the streaming service"""
+    """Make a request to the streaming service - matching CloudStream logic"""
     headers = get_headers(provider_id)
     cookies = get_cookies(provider_id, bypass_cookie)
     
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
         response = await client.get(url, headers=headers, cookies=cookies)
         
+        # Check for empty response
         if not response.text or not response.text.strip():
             raise ValueError("Empty response from server")
         
+        # Parse JSON
         try:
             return response.json()
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON response: {response.text[:200]}")
 
 
@@ -199,8 +198,11 @@ async def search_content(provider, query):
         return {"error": f"Invalid provider: {provider}"}, 400
     
     config = PROVIDERS[provider]
+    
+    # Get fresh bypass cookie
     bypass_cookie = await get_bypass_cookie()
     
+    # Build search URL with timestamp
     url = f"{BASE_URL}{config['search_path']}?s={query}&t={get_timestamp()}"
     
     try:
@@ -227,13 +229,16 @@ async def search_content(provider, query):
 
 
 async def get_details(provider, content_id):
-    """Get detailed information about content"""
+    """Get detailed information about content - matching CloudStream logic"""
     if provider not in PROVIDERS:
         return {"error": f"Invalid provider: {provider}"}, 400
     
     config = PROVIDERS[provider]
+    
+    # Get fresh bypass cookie
     bypass_cookie = await get_bypass_cookie()
     
+    # Build details URL
     url = f"{BASE_URL}{config['details_path']}?id={content_id}&t={get_timestamp()}"
     
     try:
@@ -249,12 +254,24 @@ async def get_details(provider, content_id):
                         "title": ep.get("t", ""),
                         "episode": int(ep.get("ep", "E0").replace("E", "")) if ep.get("ep") else None,
                         "season": int(ep.get("s", "S0").replace("S", "")) if ep.get("s") else None,
-                        "poster_url": f"{config['episode_poster']}/{ep['id']}.jpg"
+                        "poster_url": f"{config['episode_poster']}/{ep['id']}.jpg",
+                        "runtime": ep.get("time", "").replace("m", "")
                     })
         
         # Parse cast and genres
         cast = [n.strip() for n in data.get("cast", "").split(",")] if data.get("cast") else []
         genres = [g.strip() for g in data.get("genre", "").split(",") if g.strip()]
+        
+        # Convert runtime
+        runtime_str = data.get("runtime", "")
+        runtime_minutes = 0
+        if runtime_str:
+            parts = runtime_str.split()
+            for part in parts:
+                if part.endswith("h"):
+                    runtime_minutes += int(part.replace("h", "")) * 60
+                elif part.endswith("m"):
+                    runtime_minutes += int(part.replace("m", ""))
         
         return {
             "id": content_id,
@@ -263,9 +280,12 @@ async def get_details(provider, content_id):
             "year": data.get("year"),
             "type": "movie" if not episodes else "series",
             "poster_url": f"{config['poster_base']}/{content_id}.jpg",
+            "background_url": f"{config['poster_base'].replace('/v', '/h')}/{content_id}.jpg",
             "genres": genres,
             "cast": cast,
             "rating": data.get("match", "").replace("IMDb ", ""),
+            "runtime_minutes": runtime_minutes if runtime_minutes > 0 else None,
+            "content_rating": data.get("ua"),
             "provider": provider,
             "episodes": episodes,
             "total_episodes": len(episodes)
@@ -276,15 +296,22 @@ async def get_details(provider, content_id):
 
 
 async def get_stream(provider, content_id, title=""):
-    """Extract streaming URLs for content"""
+    """Extract streaming URLs - exactly matching CloudStream's loadLinks logic"""
     if provider not in PROVIDERS:
         return {"error": f"Invalid provider: {provider}"}, 400
     
     config = PROVIDERS[provider]
+    
+    # Get fresh bypass cookie
     bypass_cookie = await get_bypass_cookie()
     
-    # Build URL
-    url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
+    # Build stream URL - matching CloudStream exactly
+    if provider == "netflix":
+        # Netflix uses /tv/playlist.php on newUrl domain
+        url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
+    else:
+        # Other providers use their specific paths
+        url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
     
     try:
         data = await make_request(url, config["id"], bypass_cookie)
@@ -292,19 +319,20 @@ async def get_stream(provider, content_id, title=""):
         streams = []
         subtitles = []
         
-        # Handle array response
+        # Handle array or single object response
         if isinstance(data, list):
             playlist = data
         else:
             playlist = [data]
         
         for item in playlist:
-            # Extract streams
+            # Extract streams - matching CloudStream logic
             for source in item.get("sources", []):
                 file_url = source.get("file", "")
                 
-                # Clean up URL
-                if provider in ["netflix", "primevideo"]:
+                # Clean up URL - matching CloudStream's logic
+                if provider == "netflix" or provider == "primevideo":
+                    # Remove /tv/ prefix
                     file_url = file_url.replace("/tv/", "/")
                 
                 # Build full URL
@@ -313,27 +341,28 @@ async def get_stream(provider, content_id, title=""):
                 else:
                     stream_url = file_url
                 
-                # Extract quality
-                quality = "HD"
+                # Extract quality from URL parameter
+                quality = source.get("label", "HD")
                 if "q=" in file_url:
                     quality = file_url.split("q=")[1].split("&")[0]
                 
                 streams.append({
                     "url": stream_url,
-                    "quality": source.get("label", quality),
+                    "quality": quality,
                     "type": source.get("type", "m3u8"),
                     "headers": {
-                        "Referer": f"{STREAM_URL}/home",
+                        "Referer": f"{STREAM_URL}/home" if provider != "netflix" else f"{STREAM_URL}/",
                         "Cookie": "hd=on",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                     }
                 })
             
-            # Extract subtitles
+            # Extract subtitles - matching CloudStream logic
             for track in item.get("tracks", []):
                 if track.get("kind") == "captions":
                     sub_url = track.get("file", "")
                     if sub_url:
+                        # Fix URL format
                         if sub_url.startswith("//"):
                             sub_url = f"https:{sub_url}"
                         elif not sub_url.startswith("http"):
@@ -355,7 +384,7 @@ async def get_stream(provider, content_id, title=""):
         }, 200
         
     except Exception as e:
-        return {"error": str(e), "provider": provider}, 500
+        return {"error": str(e), "provider": provider, "details": str(type(e).__name__)}, 500
 
 
 async def search_all_providers(query):
@@ -423,7 +452,7 @@ class handler(BaseHTTPRequestHandler):
             if path in ['/', '']:
                 response = {
                     "name": "Streaming Content API",
-                    "version": "2.0.0",
+                    "version": "2.0.1",
                     "status": "online",
                     "providers": {k: v["name"] for k, v in PROVIDERS.items()},
                     "endpoints": {
@@ -432,7 +461,8 @@ class handler(BaseHTTPRequestHandler):
                         "details": "/api/{provider}/details?id={id}",
                         "stream": "/api/{provider}/stream?id={id}&title={title}",
                         "health": "/health"
-                    }
+                    },
+                    "note": "Fixed to match CloudStream extraction logic"
                 }
                 self.send_json_response(response)
                 return
@@ -443,7 +473,7 @@ class handler(BaseHTTPRequestHandler):
                     "status": "healthy",
                     "timestamp": datetime.now().isoformat(),
                     "cookie_cached": COOKIE_CACHE["cookie"] is not None,
-                    "cookie_age": int(time.time() - COOKIE_CACHE["timestamp"]) if COOKIE_CACHE["cookie"] else None
+                    "cookie_age_seconds": int(time.time() - COOKIE_CACHE["timestamp"]) if COOKIE_CACHE["cookie"] else None
                 }
                 self.send_json_response(response)
                 return
