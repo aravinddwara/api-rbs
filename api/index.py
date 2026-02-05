@@ -13,6 +13,12 @@ STREAM_DOMAIN = "net51.cc"
 BASE_URL = f"https://{BASE_DOMAIN}"
 STREAM_URL = f"https://{STREAM_DOMAIN}"
 
+# IMPORTANT: Check if net52.cc is the actual streaming domain
+# The user mentioned net52.cc in their example
+# Let's keep both for fallback
+ALT_STREAM_DOMAIN = "net52.cc"
+ALT_STREAM_URL = f"https://{ALT_STREAM_DOMAIN}"
+
 # Global cookie cache
 COOKIE_CACHE = {
     "cookie": None,
@@ -306,9 +312,12 @@ async def get_stream(provider, content_id, title=""):
     bypass_cookie = await get_bypass_cookie()
     
     # Build stream URL - matching CloudStream exactly
+    # IMPORTANT: For stream requests, we need to use proper cookies
+    cookies = get_cookies(config["id"], bypass_cookie)
+    
     # CloudStream uses different paths per provider
     if provider == "netflix":
-        # Netflix: /tv/playlist.php
+        # Netflix: /tv/playlist.php on STREAM_URL domain
         url = f"{STREAM_URL}/tv/playlist.php?id={content_id}&t={title}&tm={get_timestamp()}"
     elif provider == "primevideo":
         # Prime Video: /pv/playlist.php
@@ -320,7 +329,22 @@ async def get_stream(provider, content_id, title=""):
         url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
     
     try:
-        data = await make_request(url, config["id"], bypass_cookie)
+        # Make request with proper cookies
+        headers = get_headers(config["id"])
+        
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            response = await client.get(url, headers=headers, cookies=cookies)
+            
+            if not response.text or not response.text.strip():
+                raise ValueError("Empty response from server")
+            
+            try:
+                data = response.json()
+            except json.JSONDecodeError:
+                raise ValueError(f"Invalid JSON response: {response.text[:200]}")
+        
+        # DEBUG: Store raw response
+        raw_response = data
         
         streams = []
         subtitles = []
@@ -334,22 +358,24 @@ async def get_stream(provider, content_id, title=""):
         for item in playlist:
             # Extract streams - matching CloudStream logic exactly
             for source in item.get("sources", []):
+                # Get the EXACT file URL from API - don't modify it!
                 file_url = source.get("file", "")
                 
-                # CloudStream's exact logic for URL construction per provider
+                # CloudStream's logic: 
+                # For Netflix/Prime: """$newUrl${it.file.replace("/tv/", "/")}"""
+                # This means we should use the EXACT file path from API
+                
                 if provider == "netflix" or provider == "primevideo":
-                    # Netflix/Prime: """$newUrl${it.file.replace("/tv/", "/")}"""
-                    # This means: remove /tv/ prefix, then prepend STREAM_URL
+                    # Only replace /tv/ prefix, keep everything else including query params
                     file_url = file_url.replace("/tv/", "/")
                     if not file_url.startswith("http"):
-                        # If file starts with /, just prepend domain
-                        # If not, add / then prepend domain  
+                        # Prepend STREAM_URL - file_url should have the full path + params
                         stream_url = f"{STREAM_URL}{file_url}" if file_url.startswith("/") else f"{STREAM_URL}/{file_url}"
                     else:
                         stream_url = file_url
                     referer = f"{STREAM_URL}/"
                 elif provider in ["hotstar", "disneyplus"]:
-                    # Hotstar/Disney+: """$newUrl/${it.file}"""
+                    # Hotstar/Disney+: Keep exact file URL
                     if not file_url.startswith("http"):
                         stream_url = f"{STREAM_URL}/{file_url.lstrip('/')}"
                     else:
@@ -369,6 +395,7 @@ async def get_stream(provider, content_id, title=""):
                 if "q=" in file_url:
                     try:
                         # substringAfter("q=", "") means: get everything after q=, or empty string if not found
+                        # But we only want the quality value, not the rest
                         quality_param = file_url.split("q=")[1].split("&")[0] if "q=" in file_url else ""
                         if quality_param:
                             quality = quality_param
@@ -412,7 +439,8 @@ async def get_stream(provider, content_id, title=""):
             "streams": streams,
             "subtitles": subtitles,
             "timestamp": datetime.now().isoformat(),
-            "total_streams": len(streams)
+            "total_streams": len(streams),
+            "_raw_api_response": raw_response  # DEBUG: Include raw response
         }, 200
         
     except Exception as e:
@@ -484,17 +512,17 @@ class handler(BaseHTTPRequestHandler):
             if path in ['/', '']:
                 response = {
                     "name": "Streaming Content API",
-                    "version": "2.0.1",
+                    "version": "2.0.2",
                     "status": "online",
                     "providers": {k: v["name"] for k, v in PROVIDERS.items()},
                     "endpoints": {
                         "search_all": "/api/search?query={query}",
                         "search": "/api/{provider}/search?query={query}",
                         "details": "/api/{provider}/details?id={id}",
-                        "stream": "/api/{provider}/stream?id={id}&title={title}",
+                        "stream": "/api/{provider}/stream?id={id}&title={title}&debug=1 (optional)",
                         "health": "/health"
                     },
-                    "note": "Fixed to match CloudStream extraction logic"
+                    "note": "Stream requests now include proper cookies and user_token. Add &debug=1 to stream endpoint to see raw API response."
                 }
                 self.send_json_response(response)
                 return
@@ -553,12 +581,18 @@ class handler(BaseHTTPRequestHandler):
                     elif action == 'stream':
                         content_id = params.get('id', [''])[0]
                         title = params.get('title', [''])[0]
+                        debug = params.get('debug', ['0'])[0] == '1'
                         
                         if not content_id:
                             self.send_json_response({"error": "ID parameter required"}, 400)
                             return
                         
                         result, status = asyncio.run(get_stream(provider, content_id, title))
+                        
+                        # Remove raw response if not in debug mode
+                        if not debug and isinstance(result, dict) and '_raw_api_response' in result:
+                            del result['_raw_api_response']
+                        
                         self.send_json_response(result, status)
                         return
             
