@@ -306,11 +306,17 @@ async def get_stream(provider, content_id, title=""):
     bypass_cookie = await get_bypass_cookie()
     
     # Build stream URL - matching CloudStream exactly
+    # CloudStream uses different paths per provider
     if provider == "netflix":
-        # Netflix uses /tv/playlist.php on newUrl domain
-        url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
+        # Netflix: /tv/playlist.php
+        url = f"{STREAM_URL}/tv/playlist.php?id={content_id}&t={title}&tm={get_timestamp()}"
+    elif provider == "primevideo":
+        # Prime Video: /pv/playlist.php
+        url = f"{STREAM_URL}/pv/playlist.php?id={content_id}&t={title}&tm={get_timestamp()}"
+    elif provider in ["hotstar", "disneyplus"]:
+        # Hotstar/Disney+: /mobile/hs/playlist.php
+        url = f"{STREAM_URL}/mobile/hs/playlist.php?id={content_id}&t={title}&tm={get_timestamp()}"
     else:
-        # Other providers use their specific paths
         url = f"{STREAM_URL}{config['stream_path']}?id={content_id}&t={title}&tm={get_timestamp()}"
     
     try:
@@ -326,32 +332,58 @@ async def get_stream(provider, content_id, title=""):
             playlist = [data]
         
         for item in playlist:
-            # Extract streams - matching CloudStream logic
+            # Extract streams - matching CloudStream logic exactly
             for source in item.get("sources", []):
                 file_url = source.get("file", "")
                 
-                # Clean up URL - matching CloudStream's logic
+                # CloudStream's exact logic for URL construction per provider
                 if provider == "netflix" or provider == "primevideo":
-                    # Remove /tv/ prefix
+                    # Netflix/Prime: """$newUrl${it.file.replace("/tv/", "/")}"""
+                    # This means: remove /tv/ prefix, then prepend STREAM_URL
                     file_url = file_url.replace("/tv/", "/")
-                
-                # Build full URL
-                if not file_url.startswith("http"):
-                    stream_url = f"{STREAM_URL}/{file_url.lstrip('/')}"
+                    if not file_url.startswith("http"):
+                        # If file starts with /, just prepend domain
+                        # If not, add / then prepend domain  
+                        stream_url = f"{STREAM_URL}{file_url}" if file_url.startswith("/") else f"{STREAM_URL}/{file_url}"
+                    else:
+                        stream_url = file_url
+                    referer = f"{STREAM_URL}/"
+                elif provider in ["hotstar", "disneyplus"]:
+                    # Hotstar/Disney+: """$newUrl/${it.file}"""
+                    if not file_url.startswith("http"):
+                        stream_url = f"{STREAM_URL}/{file_url.lstrip('/')}"
+                    else:
+                        stream_url = file_url
+                    referer = f"{STREAM_URL}/home"
                 else:
-                    stream_url = file_url
+                    # Fallback
+                    if not file_url.startswith("http"):
+                        stream_url = f"{STREAM_URL}/{file_url.lstrip('/')}"
+                    else:
+                        stream_url = file_url
+                    referer = f"{STREAM_URL}/home"
                 
-                # Extract quality from URL parameter
+                # Extract quality - CloudStream gets it via getQualityFromName(it.file.substringAfter("q=", ""))
                 quality = source.get("label", "HD")
+                # Try to extract from URL parameter q=
                 if "q=" in file_url:
-                    quality = file_url.split("q=")[1].split("&")[0]
+                    try:
+                        # substringAfter("q=", "") means: get everything after q=, or empty string if not found
+                        quality_param = file_url.split("q=")[1].split("&")[0] if "q=" in file_url else ""
+                        if quality_param:
+                            quality = quality_param
+                    except:
+                        pass
+                
+                # Determine type from source or file extension
+                stream_type = source.get("type", "application/vnd.apple.mpegurl")
                 
                 streams.append({
                     "url": stream_url,
                     "quality": quality,
-                    "type": source.get("type", "m3u8"),
+                    "type": stream_type,
                     "headers": {
-                        "Referer": f"{STREAM_URL}/home" if provider != "netflix" else f"{STREAM_URL}/",
+                        "Referer": referer,
                         "Cookie": "hd=on",
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                     }
@@ -362,7 +394,7 @@ async def get_stream(provider, content_id, title=""):
                 if track.get("kind") == "captions":
                     sub_url = track.get("file", "")
                     if sub_url:
-                        # Fix URL format
+                        # Fix URL format - httpsify(track.file.toString())
                         if sub_url.startswith("//"):
                             sub_url = f"https:{sub_url}"
                         elif not sub_url.startswith("http"):
