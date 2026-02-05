@@ -462,5 +462,7 @@ async def get_episodes(
     }
 
 
-# Vercel serverless handler
-handler = app
+# Export for Vercel serverless
+from mangum import Mangum
+
+handler = Mangum(app)
